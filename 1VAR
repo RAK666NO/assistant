@@ -1,0 +1,586 @@
+#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_NONSTDC_NO_DEPRECATE
+#define WINVER 0x0A00
+#define _WIN32_WINNT 0x0A00
+#pragma warning(disable: 4996)
+
+#include <windows.h>
+#include <sapi.h>
+#include <sphelper.h>
+#include <string>
+#include <vector>
+#include <thread>
+#include <atomic>
+#include <cstdlib>
+#include <ctime>
+
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "sapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "user32.lib")
+
+// ============ Global variables ============
+ISpVoice* pVoice = NULL;
+HWND hMainWindow = NULL;
+std::atomic<bool> bProcessingCommand(false);
+std::vector<std::wstring> commandHistory;
+int historyIndex = -1;
+
+// ============ Text to Speech ============
+void Speak(const std::wstring& text) {
+    if (pVoice) {
+        pVoice->Speak(text.c_str(), SPF_DEFAULT, NULL);
+    }
+}
+
+// ============ Media Control ============
+void SendMediaKey(BYTE keyCode) {
+    INPUT ip = {0};
+    ip.type = INPUT_KEYBOARD;
+    ip.ki.wVk = keyCode;
+    
+    SendInput(1, &ip, sizeof(INPUT));
+    Sleep(50);
+    ip.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &ip, sizeof(INPUT));
+}
+
+void MediaPlayPause() {
+    SendMediaKey(VK_MEDIA_PLAY_PAUSE);
+    Speak(L"Пауза");
+}
+
+void MediaNextTrack() {
+    SendMediaKey(VK_MEDIA_NEXT_TRACK);
+    Speak(L"Следующий трек");
+}
+
+void MediaPrevTrack() {
+    SendMediaKey(VK_MEDIA_PREV_TRACK);
+    Speak(L"Предыдущий трек");
+}
+
+void VolumeUp() {
+    SendMediaKey(VK_VOLUME_UP);
+    Speak(L"Громче");
+}
+
+void VolumeDown() {
+    SendMediaKey(VK_VOLUME_DOWN);
+    Speak(L"Тише");
+}
+
+void VolumeMute() {
+    SendMediaKey(VK_VOLUME_MUTE);
+    Speak(L"Звук выключен");
+}
+
+void OpenBrowser(const std::wstring& url) {
+    ShellExecuteW(NULL, L"open", url.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    Speak(L"Открываю");
+}
+
+void OpenProgram(const std::wstring& program) {
+    ShellExecuteW(NULL, L"open", program.c_str(), NULL, NULL, SW_SHOWNORMAL);
+    Speak(L"Запускаю");
+}
+
+void LockComputer() {
+    LockWorkStation();
+    Speak(L"Компьютер заблокирован");
+}
+
+void ShowDesktop() {
+    keybd_event(VK_LWIN, 0, 0, 0);
+    keybd_event('D', 0, 0, 0);
+    keybd_event('D', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    Speak(L"Рабочий стол");
+}
+
+void OpenTaskManager() {
+    keybd_event(VK_LCONTROL, 0, 0, 0);
+    keybd_event(VK_LSHIFT, 0, 0, 0);
+    keybd_event(VK_ESCAPE, 0, 0, 0);
+    keybd_event(VK_ESCAPE, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LSHIFT, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LCONTROL, 0, KEYEVENTF_KEYUP, 0);
+    Speak(L"Диспетчер задач");
+}
+
+// ============ Показать окно со списком команд ============
+void ShowCommandsList() {
+    // Создаем окно со списком команд
+    HWND hCommandsDlg = CreateWindowExW(
+        WS_EX_TOPMOST,
+        L"STATIC",
+        L"📋 Список команд ассистента",
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+        300, 200, 550, 580,
+        hMainWindow, NULL, GetModuleHandle(NULL), NULL
+    );
+    
+    // Создаем поле со списком (ListBox)
+    HWND hListBox = CreateWindowExW(
+        0,
+        L"LISTBOX",
+        L"",
+        WS_CHILD | WS_VISIBLE | WS_BORDER | WS_VSCROLL | LBS_NOTIFY,
+        10, 10, 510, 490,
+        hCommandsDlg, (HMENU)101, GetModuleHandle(NULL), NULL
+    );
+    
+    // Кнопка закрытия
+    HWND hCloseBtn = CreateWindowExW(
+        0,
+        L"BUTTON",
+        L"Закрыть",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        450, 510, 70, 30,
+        hCommandsDlg, (HMENU)IDOK, GetModuleHandle(NULL), NULL
+    );
+    
+    // Список команд (категории и команды)
+    const wchar_t* commands[] = {
+        L"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        L"📌 КОМАНДЫ АССИСТЕНТА",
+        L"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        L"",
+        L"━━━━━━━━━━ 👋 ПРИВЕТСТВИЯ ━━━━━━━━━━",
+        L"  привет                    - Здоровается",
+        L"  как дела                  - Спрашивает как дела",
+        L"  кто ты                    - Представляется",
+        L"",
+        L"━━━━━━━━━━ 🎵 МУЗЫКА ━━━━━━━━━━",
+        L"  следующий трек / дальше    - Следующий трек",
+        L"  предыдущий трек / назад    - Предыдущий трек",
+        L"  пауза / стоп               - Пауза",
+        L"  плей / играй / включи      - Воспроизвести",
+        L"",
+        L"━━━━━━━━━━ 🔊 ГРОМКОСТЬ ━━━━━━━━━━",
+        L"  громче                     - Увеличить громкость",
+        L"  тише                       - Уменьшить громкость",
+        L"  выключи звук               - Отключить звук",
+        L"",
+        L"━━━━━━━━━━ 🌐 БРАУЗЕР И САЙТЫ ━━━━━━━━━━",
+        L"  google / открой браузер    - Открыть Google",
+        L"  ютуб / youtube             - Открыть YouTube",
+        L"  вики / википедия           - Открыть Википедию",
+        L"",
+        L"━━━━━━━━━━ 📁 ПРОГРАММЫ ━━━━━━━━━━",
+        L"  калькулятор                - Запустить калькулятор",
+        L"  блокнот                    - Запустить блокнот",
+        L"  проводник                  - Открыть проводник",
+        L"",
+        L"━━━━━━━━━━ ⏰ ВРЕМЯ И ДАТА ━━━━━━━━━━",
+        L"  время                      - Текущее время",
+        L"  дата                       - Текущая дата",
+        L"",
+        L"━━━━━━━━━━ 🖥️ СИСТЕМА ━━━━━━━━━━",
+        L"  заблокируй                 - Блокировка компьютера",
+        L"  рабочий стол               - Показать рабочий стол",
+        L"  диспетчер задач            - Открыть диспетчер задач",
+        L"",
+        L"━━━━━━━━━━ 😄 РАЗВЛЕЧЕНИЯ ━━━━━━━━━━",
+        L"  расскажи шутку / шутку     - Рассказать шутку",
+        L"",
+        L"━━━━━━━━━━ ❓ ПРОЧЕЕ ━━━━━━━━━━",
+        L"  помощь / команды / список  - Показать этот список",
+        L"  пока / выход               - Закрыть ассистента",
+        L"",
+        L"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        L"  💡 Нажмите F12 для ввода команды",
+        L"  🖱️ Перетащите окно мышкой",
+        L"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    };
+    
+    int numCommands = sizeof(commands) / sizeof(commands[0]);
+    
+    // Заполняем ListBox командами
+    for (int i = 0; i < numCommands; i++) {
+        SendMessageW(hListBox, LB_ADDSTRING, 0, (LPARAM)commands[i]);
+    }
+    
+    // Настройка шрифта (Consolas для ровного отображения)
+    HFONT hFont = CreateFontW(14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                              DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              DEFAULT_QUALITY, FIXED_PITCH | FF_DONTCARE, L"Consolas");
+    SendMessageW(hListBox, WM_SETFONT, (WPARAM)hFont, TRUE);
+    SendMessageW(hCloseBtn, WM_SETFONT, (WPARAM)hFont, TRUE);
+    
+    // Цикл сообщений для диалога
+    MSG msg;
+    while (IsWindow(hCommandsDlg) && GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+        
+        if (msg.message == WM_COMMAND && LOWORD(msg.wParam) == IDOK) {
+            DestroyWindow(hCommandsDlg);
+            break;
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) {
+            DestroyWindow(hCommandsDlg);
+            break;
+        }
+    }
+    
+    DeleteObject(hFont);
+}
+
+// ============ Execute Commands ============
+void ExecuteCommand(const std::wstring& command) {
+    if (bProcessingCommand) return;
+    bProcessingCommand = true;
+    
+    if (commandHistory.empty() || commandHistory.back() != command) {
+        commandHistory.push_back(command);
+        historyIndex = (int)commandHistory.size();
+    }
+    
+    SetWindowTextW(hMainWindow, (L"📝 " + command).c_str());
+    
+    std::wstring lower = command;
+    for (auto& c : lower) c = towlower(c);
+    
+    // ПРИВЕТСТВИЯ
+    if (lower.find(L"привет") != std::wstring::npos) {
+        Speak(L"Здравствуйте! Нажмите F12 для команд");
+    }
+    else if (lower.find(L"как дела") != std::wstring::npos) {
+        Speak(L"Всё отлично!");
+    }
+    else if (lower.find(L"кто ты") != std::wstring::npos) {
+        Speak(L"Я голосовой ассистент. Умею управлять музыкой, открывать программы и сайты.");
+    }
+    
+    // МУЗЫКА
+    else if (lower.find(L"следующий") != std::wstring::npos || lower.find(L"дальше") != std::wstring::npos) {
+        MediaNextTrack();
+    }
+    else if (lower.find(L"предыдущий") != std::wstring::npos || lower.find(L"назад") != std::wstring::npos) {
+        MediaPrevTrack();
+    }
+    else if (lower.find(L"пауза") != std::wstring::npos || lower.find(L"стоп") != std::wstring::npos) {
+        MediaPlayPause();
+    }
+    else if (lower.find(L"плей") != std::wstring::npos || lower.find(L"играй") != std::wstring::npos || lower.find(L"включи") != std::wstring::npos) {
+        MediaPlayPause();
+    }
+    
+    // ГРОМКОСТЬ
+    else if (lower.find(L"громче") != std::wstring::npos) {
+        VolumeUp();
+    }
+    else if (lower.find(L"тише") != std::wstring::npos) {
+        VolumeDown();
+    }
+    else if (lower.find(L"выключи звук") != std::wstring::npos) {
+        VolumeMute();
+    }
+    
+    // САЙТЫ
+    else if (lower.find(L"google") != std::wstring::npos || (lower.find(L"браузер") != std::wstring::npos)) {
+        OpenBrowser(L"https://www.google.com");
+    }
+    else if (lower.find(L"ютуб") != std::wstring::npos || lower.find(L"youtube") != std::wstring::npos) {
+        OpenBrowser(L"https://www.youtube.com");
+    }
+    else if (lower.find(L"вики") != std::wstring::npos) {
+        OpenBrowser(L"https://ru.wikipedia.org");
+    }
+    
+    // ПРОГРАММЫ
+    else if (lower.find(L"калькулятор") != std::wstring::npos) {
+        OpenProgram(L"calc.exe");
+    }
+    else if (lower.find(L"блокнот") != std::wstring::npos) {
+        OpenProgram(L"notepad.exe");
+    }
+    else if (lower.find(L"проводник") != std::wstring::npos) {
+        OpenProgram(L"explorer.exe");
+    }
+    
+    // ВРЕМЯ
+    else if (lower.find(L"время") != std::wstring::npos) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t timeStr[100];
+        wsprintfW(timeStr, L"Сейчас %d часов %d минут", st.wHour, st.wMinute);
+        Speak(timeStr);
+    }
+    else if (lower.find(L"дата") != std::wstring::npos) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t dateStr[100];
+        const wchar_t* months[] = {L"января", L"февраля", L"марта", L"апреля", L"мая", L"июня",
+                                    L"июля", L"августа", L"сентября", L"октября", L"ноября", L"декабря"};
+        wsprintfW(dateStr, L"Сегодня %d %s", st.wDay, months[st.wMonth-1]);
+        Speak(dateStr);
+    }
+    
+    // СИСТЕМА
+    else if (lower.find(L"заблокируй") != std::wstring::npos) {
+        LockComputer();
+    }
+    else if (lower.find(L"рабочий стол") != std::wstring::npos) {
+        ShowDesktop();
+    }
+    else if (lower.find(L"диспетчер") != std::wstring::npos) {
+        OpenTaskManager();
+    }
+    
+    // ШУТКИ
+    else if (lower.find(L"шутку") != std::wstring::npos || lower.find(L"расскажи") != std::wstring::npos) {
+        const wchar_t* jokes[] = {
+            L"Почему программисты не любят природу? Слишком много багов",
+            L"Есть 10 типов людей: те кто понимает двоичную систему и те кто нет",
+            L"Встречаются два программиста. - У тебя есть 10 рублей? - Почти 2 рубля",
+            L"Идёт экзамен. Студент тянет билет. - Ваш вопрос: как перевернуть слонёнка?"
+        };
+        int r = rand() % 4;
+        Speak(jokes[r]);
+    }
+    
+    // ПОМОЩЬ - ОТКРЫВАЕТ ОКНО СО СПИСКОМ КОМАНД
+    else if (lower.find(L"помощь") != std::wstring::npos || 
+             lower.find(L"команды") != std::wstring::npos ||
+             lower.find(L"список") != std::wstring::npos) {
+        ShowCommandsList();
+        Speak(L"Открываю список команд");
+    }
+    
+    // ВЫХОД
+    else if (lower.find(L"пока") != std::wstring::npos || lower.find(L"выход") != std::wstring::npos) {
+        Speak(L"До свидания!");
+        PostQuitMessage(0);
+    }
+    
+    // НЕИЗВЕСТНО
+    else {
+        Speak(L"Не знаю такой команды. Напишите 'помощь'");
+    }
+    
+    bProcessingCommand = false;
+    SetWindowTextW(hMainWindow, L"🎙️ F12 для команды");
+}
+
+// ============ F12 Thread ============
+void WaitForF12Thread() {
+    while (true) {
+        if (GetAsyncKeyState(VK_F12) & 0x0001) {
+            if (!bProcessingCommand) {
+                HWND hDlg = CreateWindowExW(0, L"STATIC", L"Введите команду",
+                    WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+                    400, 300, 400, 120,
+                    hMainWindow, NULL, GetModuleHandle(NULL), NULL);
+                
+                HWND hEdit = CreateWindowExW(0, L"EDIT", L"",
+                    WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT,
+                    10, 30, 360, 25,
+                    hDlg, (HMENU)100, GetModuleHandle(NULL), NULL);
+                
+                CreateWindowExW(0, L"BUTTON", L"OK",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    250, 70, 60, 30,
+                    hDlg, (HMENU)IDOK, GetModuleHandle(NULL), NULL);
+                
+                CreateWindowExW(0, L"BUTTON", L"Отмена",
+                    WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    320, 70, 60, 30,
+                    hDlg, (HMENU)IDCANCEL, GetModuleHandle(NULL), NULL);
+                
+                SetFocus(hEdit);
+                
+                MSG msg;
+                std::wstring input;
+                
+                while (IsWindow(hDlg) && GetMessage(&msg, NULL, 0, 0)) {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                    
+                    if (msg.message == WM_KEYDOWN && msg.wParam == VK_UP && historyIndex > 0) {
+                        historyIndex--;
+                        SetWindowTextW(hEdit, commandHistory[historyIndex].c_str());
+                    }
+                    else if (msg.message == WM_KEYDOWN && msg.wParam == VK_DOWN && historyIndex < (int)commandHistory.size()) {
+                        historyIndex++;
+                        if (historyIndex < (int)commandHistory.size()) {
+                            SetWindowTextW(hEdit, commandHistory[historyIndex].c_str());
+                        } else {
+                            SetWindowTextW(hEdit, L"");
+                        }
+                    }
+                    else if (msg.message == WM_COMMAND) {
+                        if (LOWORD(msg.wParam) == IDOK) {
+                            wchar_t buffer[1024] = {0};
+                            GetWindowTextW(hEdit, buffer, 1024);
+                            input = buffer;
+                            DestroyWindow(hDlg);
+                            break;
+                        }
+                        else if (LOWORD(msg.wParam) == IDCANCEL) {
+                            DestroyWindow(hDlg);
+                            break;
+                        }
+                    }
+                    else if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) {
+                        wchar_t buffer[1024] = {0};
+                        GetWindowTextW(hEdit, buffer, 1024);
+                        input = buffer;
+                        DestroyWindow(hDlg);
+                        break;
+                    }
+                }
+                
+                if (!input.empty()) {
+                    ExecuteCommand(input);
+                }
+            }
+            Sleep(500);
+        }
+        Sleep(50);
+    }
+}
+
+// ============ Initialize Speech ============
+bool InitializeSpeech() {
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    
+    if (FAILED(CoCreateInstance(CLSID_SpVoice, NULL, CLSCTX_ALL, IID_ISpVoice, (void**)&pVoice))) {
+        return false;
+    }
+    
+    // Пытаемся найти русский голос
+    ISpObjectToken* pToken = NULL;
+    ISpObjectTokenCategory* pCategory = NULL;
+    
+    if (SUCCEEDED(SpGetCategoryFromId(SPCAT_VOICES, &pCategory))) {
+        IEnumSpObjectTokens* pEnum = NULL;
+        if (SUCCEEDED(pCategory->EnumTokens(NULL, NULL, &pEnum))) {
+            ISpObjectToken* pCurToken = NULL;
+            while (S_OK == pEnum->Next(1, &pCurToken, NULL)) {
+                LPWSTR pszId = NULL;
+                if (SUCCEEDED(pCurToken->GetId(&pszId))) {
+                    std::wstring tokenId(pszId);
+                    if (tokenId.find(L"Russian") != std::wstring::npos ||
+                        tokenId.find(L"Irina") != std::wstring::npos) {
+                        pToken = pCurToken;
+                        pCurToken->AddRef();
+                        CoTaskMemFree(pszId);
+                        break;
+                    }
+                    CoTaskMemFree(pszId);
+                }
+                pCurToken->Release();
+            }
+            pEnum->Release();
+        }
+        pCategory->Release();
+    }
+    
+    if (pToken) {
+        pVoice->SetVoice(pToken);
+        pToken->Release();
+    }
+    
+    pVoice->SetVolume(100);
+    return true;
+}
+
+// ============ Create Main Window ============
+HWND CreateAssistantWindow(HINSTANCE hInstance) {
+    const wchar_t CLASS_NAME[] = L"AssistantWindow";
+    
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) -> LRESULT {
+        static POINT dragPoint;
+        static bool bDragging = false;
+        
+        switch (msg) {
+            case WM_CREATE:
+                SetWindowLong(hwnd, GWL_EXSTYLE, 
+                    GetWindowLong(hwnd, GWL_EXSTYLE) | WS_EX_LAYERED | WS_EX_TOPMOST);
+                SetLayeredWindowAttributes(hwnd, 0, 230, LWA_ALPHA);
+                break;
+                
+            case WM_LBUTTONDOWN:
+                SetCapture(hwnd);
+                bDragging = true;
+                GetCursorPos(&dragPoint);
+                break;
+                
+            case WM_MOUSEMOVE:
+                if (bDragging) {
+                    POINT cursor;
+                    GetCursorPos(&cursor);
+                    RECT rect;
+                    GetWindowRect(hwnd, &rect);
+                    SetWindowPos(hwnd, NULL, 
+                               rect.left + (cursor.x - dragPoint.x),
+                               rect.top + (cursor.y - dragPoint.y),
+                               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                    GetCursorPos(&dragPoint);
+                }
+                break;
+                
+            case WM_LBUTTONUP:
+                bDragging = false;
+                ReleaseCapture();
+                break;
+                
+            case WM_DESTROY:
+                PostQuitMessage(0);
+                break;
+                
+            default:
+                return DefWindowProc(hwnd, msg, wParam, lParam);
+        }
+        return 0;
+    };
+    
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hbrBackground = CreateSolidBrush(RGB(25, 25, 112));
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    
+    RegisterClassW(&wc);
+    
+    return CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_LAYERED,
+        CLASS_NAME,
+        L"🎙️ Ассистент (F12)",
+        WS_POPUP | WS_VISIBLE,
+        100, 100, 450, 100,
+        NULL, NULL, hInstance, NULL
+    );
+}
+
+// ============ Entry Point ============
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
+    srand((unsigned)time(NULL));
+    
+    if (!InitializeSpeech()) {
+        MessageBoxW(NULL, L"Не удалось инициализировать голос", L"Ошибка", MB_OK);
+        return 1;
+    }
+    
+    hMainWindow = CreateAssistantWindow(hInstance);
+    if (!hMainWindow) return 1;
+    
+    Speak(L"Ассистент запущен. Нажмите F12");
+    SetWindowTextW(hMainWindow, L"🎙️ F12 для команды");
+    
+    std::thread f12Thread(WaitForF12Thread);
+    f12Thread.detach();
+    
+    MSG msg = {};
+    while (GetMessage(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+    
+    if (pVoice) pVoice->Release();
+    CoUninitialize();
+    
+    return 0;
+}
